@@ -229,13 +229,30 @@ def main():
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
 
-            train_loss = np.average(train_loss)
-            vali_loss = vali(model, vali_data, vali_loader, criterion, args, device, ii)
-            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f}".format(
-                epoch + 1, train_steps, train_loss, vali_loss))
-
-        print("------------------------------------")
-        mse, mae, corr1, corr2 = test(model, test_data, test_loader, args, device, ii)
+        train_loss = np.average(train_loss)
+        vali_loss = vali(model, vali_data, vali_loader, criterion, args, device, ii)
+        # test_loss = vali(model, test_data, test_loader, criterion, args, device, ii)
+        # print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f}, Test Loss: {4:.7f}".format(
+        #     epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+        print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f}".format(
+            epoch + 1, train_steps, train_loss, vali_loss))
+        
+        if args.cos:
+            scheduler.step()
+            print("lr = {:.10f}".format(model_optim.param_groups[0]['lr']))
+        else:
+            adjust_learning_rate(model_optim, epoch + 1, args)
+        
+        # earlystopping
+        # early_stopping(vali_loss, model, path)
+        # if early_stopping.early_stop:
+        #     print("Early stopping")
+        #     break
+    
+    # best_model_path = path + '/' + 'checkpoint.pth'
+    # model.load_state_dict(torch.load(best_model_path, map_location=torch.device('cpu')))
+    print("------------------------------------")
+    mse, mae, corr1, corr2 = test(model, test_data, test_loader, args, device, ii)
 
         end_time = time.time()
         cpu_mem_end = process.memory_info().rss / (1024 * 1024)
