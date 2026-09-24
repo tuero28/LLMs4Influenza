@@ -20,12 +20,12 @@ class Llama2(nn.Module):
 
         self.padding_patch_layer = nn.ReplicationPad1d((0, self.stride)) 
         self.patch_num += 1
-        # self.quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+        self.quantization_config = BitsAndBytesConfig(load_in_8bit=True) # xóa #  thử
         
         if configs.is_gpt:
             if configs.pretrain:
                 try:
-                    model_dir = '/data_disk/lichx/Model_from_HF/LLAMA2'
+                    model_dir = './data_disk/lichx/Model_from_HF/LLAMA2'
                     self.llama2 = LlamaForCausalLM.from_pretrained(model_dir,
                                                                     output_attentions=True,
                                                                     output_hidden_states=True,
@@ -81,7 +81,11 @@ class Llama2(nn.Module):
         outputs = self.in_layer(x)
 
         if self.is_gpt:
+            # Convert to float16 to match Llama2's dtype
+            outputs = outputs.half()
             outputs = checkpoint(lambda inp: self.llama2.model(inputs_embeds=inp).last_hidden_state, outputs)
+            # Convert back to float32 for subsequent layers
+            outputs = outputs.float()
 
         outputs = checkpoint(lambda inp: self.fc(inp), outputs.reshape(B * M, -1))
         outputs = self.leaky_relu(outputs)

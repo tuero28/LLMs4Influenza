@@ -13,3 +13,6 @@ Output/
 Weekly/
 FLUw_pre.sh
 positive_rate.sh
+/llm4flu_env
+/data_disk
+.idea/
