@@ -7,6 +7,7 @@ from models.DLinear import DLinear
 from models.Llama2 import Llama2
 from models.Gemma2 import Gemma2
 from models.Llama3 import Llama3
+from ensemble_predictor import create_ensemble_model
 
 import numpy as np
 import torch
@@ -95,6 +96,16 @@ def main():
     parser.add_argument('--itr', type=int, default=3)
     parser.add_argument('--cos', type=int, default=0)
 
+    # Ensemble predictor arguments
+    parser.add_argument('--ensemble_weights', type=str, default='0.3,0.3,0.4',
+                        help='Comma-separated ensemble weights for DLinear, PatchTST, Llama2 (default: 0.3,0.3,0.4)')
+    parser.add_argument('--checkpoint_paths', type=str, default='',
+                        help='Comma-separated checkpoint paths for ensemble models (optional)')
+    parser.add_argument('--ensemble_iterations', type=int, default=0,
+                        help='Enable iteration ensemble (0=disabled, 1=enabled)')
+    parser.add_argument('--visualize', type=int, default=0,
+                        help='Enable visualization of predictions (0=disabled, 1=enabled)')
+
     parser.add_argument('--plt', type=int, default=0)
     parser.add_argument('--read_model', type=int, default=0)
     parser.add_argument('--write_model', type=int, default=0)
@@ -112,11 +123,23 @@ def main():
     mses = []
     maes = []
     corr_s, corr_p = [], []
-    p_s, p_p = [], []
 
     process = psutil.Process()
 
     model = None  # Giữ tham chiếu cho write_model phía sau
+    
+    # OPTIMIZATION: Load model once before iterations for Llama-based models
+    model_preloaded = None
+    if args.model in ['Llama2', 'Llama3', 'Gemma2']:
+        print(f"Pre-loading {args.model} model (will be reused across iterations)...")
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        if args.model == 'Llama2':
+            model_preloaded = Llama2(args, device)
+        elif args.model == 'Gemma2':
+            model_preloaded = Gemma2(args, device)
+        elif args.model == 'Llama3':
+            model_preloaded = Llama3(args, device)
+        print(f"{args.model} pre-loaded successfully!")
 
     for ii in range(args.itr):
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -152,7 +175,11 @@ def main():
         time_now = time.time()
         train_steps = len(train_loader)
 
-        if args.model == 'PatchTST':
+        # OPTIMIZATION: Reuse pre-loaded model if available
+        if model_preloaded is not None:
+            model = model_preloaded
+            print(f"Reusing pre-loaded {args.model} model for iteration {ii + 1}")
+        elif args.model == 'PatchTST':
             model = PatchTST(args, device)
             model.to(device)
         elif args.model == 'DLinear':
@@ -164,6 +191,9 @@ def main():
             model = Gemma2(args, device)
         elif args.model == 'Llama3':
             model = Llama3(args, device)
+        elif args.model == 'ensemble':
+            # Create ensemble predictor
+            model = create_ensemble_model(args, device)
         else:
             model = GPT4TS(args, device)
 
@@ -189,70 +219,83 @@ def main():
         criterion = nn.MSELoss()
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(model_optim, T_max=args.tmax, eta_min=1e-8)
 
-        scaler = GradScaler()
-        accumulation_steps = 4
-        for epoch in range(args.train_epochs):
-            iter_count = 0
-            train_loss = []
-            epoch_time = time.time()
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
-                iter_count += 1
-                model_optim.zero_grad()
+        # Skip training for ensemble model (uses pre-trained checkpoints)
+        if args.model != 'ensemble':
+            scaler = GradScaler()
+            accumulation_steps = 4
+            for epoch in range(args.train_epochs):
+                iter_count = 0
+                train_loss = []
+                epoch_time = time.time()
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                    iter_count += 1
+                    model_optim.zero_grad()
 
-                with autocast():
-                    batch_x = batch_x.float().to(device)
-                    batch_y = batch_y.float().to(device)
-                    batch_x_mark = batch_x_mark.to(device)
+                    with autocast():
+                        batch_x = batch_x.float().to(device)
+                        batch_y = batch_y.float().to(device)
+                        batch_x_mark = batch_x_mark.to(device)
 
-                    outputs = model(batch_x, ii)
+                        outputs = model(batch_x, ii)
 
-                    outputs = outputs[:, -args.pred_len:, :]
-                    batch_y = batch_y[:, -args.pred_len:, :].to(device)
-                    loss = criterion(outputs, batch_y) / accumulation_steps
-                    train_loss.append(loss.item())
+                        outputs = outputs[:, -args.pred_len:, :]
+                        batch_y = batch_y[:, -args.pred_len:, :].to(device)
+                        loss = criterion(outputs, batch_y) / accumulation_steps
+                        train_loss.append(loss.item())
 
-                    if (i + 1) % 1000 == 0:
-                        print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
-                        speed = (time.time() - time_now) / iter_count
-                        left_time = speed * ((args.train_epochs - epoch) * train_steps - i)
-                        print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
-                        iter_count = 0
-                        time_now = time.time()
+                        if (i + 1) % 1000 == 0:
+                            print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                            speed = (time.time() - time_now) / iter_count
+                            left_time = speed * ((args.train_epochs - epoch) * train_steps - i)
+                            print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                            iter_count = 0
+                            time_now = time.time()
 
-                    scaler.scale(loss).backward()
-                    if (i + 1) % accumulation_steps == 0:
-                        scaler.step(model_optim)
-                        scaler.update()
+                        scaler.scale(loss).backward()
+                        if (i + 1) % accumulation_steps == 0:
+                            scaler.step(model_optim)
+                            scaler.update()
 
-                    del batch_x, batch_y, outputs
-                    torch.cuda.empty_cache()
+                        del batch_x, batch_y, outputs
+                        torch.cuda.empty_cache()
 
-            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+                print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
 
-        train_loss = np.average(train_loss)
-        vali_loss = vali(model, vali_data, vali_loader, criterion, args, device, ii)
-        # test_loss = vali(model, test_data, test_loader, criterion, args, device, ii)
-        # print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f}, Test Loss: {4:.7f}".format(
-        #     epoch + 1, train_steps, train_loss, vali_loss, test_loss))
-        print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f}".format(
-            epoch + 1, train_steps, train_loss, vali_loss))
-        
-        if args.cos:
-            scheduler.step()
-            print("lr = {:.10f}".format(model_optim.param_groups[0]['lr']))
-        else:
-            adjust_learning_rate(model_optim, epoch + 1, args)
-        
-        # earlystopping
-        # early_stopping(vali_loss, model, path)
-        # if early_stopping.early_stop:
-        #     print("Early stopping")
-        #     break
+            train_loss = np.average(train_loss)
+            vali_loss = vali(model, vali_data, vali_loader, criterion, args, device, ii)
+            # test_loss = vali(model, test_data, test_loader, criterion, args, device, ii)
+            # print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f}, Test Loss: {4:.7f}".format(
+            #     epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f}".format(
+                epoch + 1, train_steps, train_loss, vali_loss))
+            
+            if args.cos:
+                scheduler.step()
+                print("lr = {:.10f}".format(model_optim.param_groups[0]['lr']))
+            else:
+                adjust_learning_rate(model_optim, epoch + 1, args)
+            
+            # earlystopping - ENABLED for saving checkpoints
+            early_stopping(vali_loss, model, path)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
     
-    # best_model_path = path + '/' + 'checkpoint.pth'
-    # model.load_state_dict(torch.load(best_model_path, map_location=torch.device('cpu')))
-    print("------------------------------------")
-    mse, mae, corr1, corr2 = test(model, test_data, test_loader, args, device, ii)
+        # Load best model for testing
+        best_model_path = path + '/' + 'checkpoint.pth'
+        if os.path.exists(best_model_path):
+            model.load_state_dict(torch.load(best_model_path, map_location=device))
+            print(f"Loaded best model from {best_model_path}")
+        
+        print("------------------------------------")
+        mse, mae, corr1, corr2 = test(model, test_data, test_loader, args, device, ii)
+        
+        # Store metrics for summary across iterations
+        mses.append(mse)
+        maes.append(mae)
+        corr_s.append(corr1)  # Spearman correlation
+        corr_p.append(corr2)  # Pearson correlation
+        # Note: p-values are not returned by test() function
 
         end_time = time.time()
         cpu_mem_end = process.memory_info().rss / (1024 * 1024)
@@ -269,27 +312,32 @@ def main():
 
         del model_optim
         del test_loader
+        # DON'T delete pre-loaded model between iterations
+        if model_preloaded is None and model is not None:
+            del model
         gc.collect()
         torch.cuda.empty_cache()
 
-    if args.write_model and model is not None:
-        save_path = './PretrainModel/' + args.model_id.split('_')[0]
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-        torch.save(model.state_dict(), save_path + '/' + args.model + '-' + 'temp.pth')
+        if args.write_model and model is not None and args.model != 'ensemble':
+            save_path = './PretrainModel/' + args.model_id.split('_')[0]
+            if not os.path.exists(save_path):
+                os.makedirs(save_path)
+            torch.save(model.state_dict(), save_path + '/' + args.model + '-' + 'temp.pth')
 
     mses = np.array(mses)
     maes = np.array(maes)
     corr_s = np.array(corr_s)
     corr_p = np.array(corr_p)
-    p_s = np.array(p_s)
-    p_p = np.array(p_p)
 
     if len(mses) > 0:
+        print("\n" + "="*60)
+        print("SUMMARY ACROSS {} ITERATIONS".format(args.itr))
+        print("="*60)
         print("mse_mean = {:.4f}, mse_std = {:.4f}".format(np.mean(mses), np.std(mses)))
-        print("mae_mean = {:.4f}, mae_std = {:.4f}\n".format(np.mean(maes), np.std(maes)))
-        print("spearmanR_mean = {:.4f}, spearmanP_mean = {:.4f}".format(np.mean(corr_s), np.mean(p_s)))
-        print("pearsonR_mean = {:.4f},pearsonP_mean = {:.4f}".format(np.mean(corr_p), np.mean(p_p)))
+        print("mae_mean = {:.4f}, mae_std = {:.4f}".format(np.mean(maes), np.std(maes)))
+        print("spearmanR_mean = {:.4f}, spearmanR_std = {:.4f}".format(np.mean(corr_s), np.std(corr_s)))
+        print("pearsonR_mean = {:.4f}, pearsonR_std = {:.4f}".format(np.mean(corr_p), np.std(corr_p)))
+        print("="*60 + "\n")
 
 
 # BẮT BUỘC TRÊN WINDOWS:

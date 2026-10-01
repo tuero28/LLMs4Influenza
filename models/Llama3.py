@@ -6,10 +6,15 @@ from torch import optim
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from einops import rearrange
 
+# Global cache for pre-loaded Llama3 model
+_LLAMA3_MODEL_CACHE = None
+
 class Llama3(nn.Module):
     
     def __init__(self, configs, device):
         super(Llama3, self).__init__()
+        global _LLAMA3_MODEL_CACHE
+        
         self.is_gpt = configs.is_gpt
         self.patch_size = configs.patch_size
         self.pretrain = configs.pretrain
@@ -22,13 +27,21 @@ class Llama3(nn.Module):
 
         if configs.is_gpt:
             if configs.pretrain:
-                self.llama3 = AutoModelForCausalLM.from_pretrained('/data_disk/lichx/Model_from_HF/LLAMA3',
-                                                        output_hidden_states=True,
-                                                        attn_implementation="eager",
-                                                        torch_dtype=torch.float16,
-                                                        low_cpu_mem_usage=True,
-                                                        quantization_config=self.quantization_config
-                                                        )
+                # OPTIMIZATION: Use cached model if available
+                if _LLAMA3_MODEL_CACHE is not None:
+                    print('------------------Using cached Llama3 model------------------')
+                    self.llama3 = _LLAMA3_MODEL_CACHE
+                else:
+                    self.llama3 = AutoModelForCausalLM.from_pretrained('/data_disk/lichx/Model_from_HF/LLAMA3',
+                                                            output_hidden_states=True,
+                                                            attn_implementation="eager",
+                                                            torch_dtype=torch.float16,
+                                                            low_cpu_mem_usage=True,
+                                                            quantization_config=self.quantization_config
+                                                            )
+                    print('------------------Llama3 loading completed------------------')
+                    # Cache the loaded model
+                    _LLAMA3_MODEL_CACHE = self.llama3
             else:
                 print("------------------no pretrain------------------")
 

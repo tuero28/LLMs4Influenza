@@ -6,11 +6,16 @@ from torch import optim
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from einops import rearrange
 
+# Global cache for pre-loaded Gemma2 model
+_GEMMA2_MODEL_CACHE = None
+
 
 class Gemma2(nn.Module):
     
     def __init__(self, configs, device):
         super(Gemma2, self).__init__()
+        global _GEMMA2_MODEL_CACHE
+        
         self.is_gpt = configs.is_gpt
         self.patch_size = configs.patch_size
         self.pretrain = configs.pretrain
@@ -23,16 +28,23 @@ class Gemma2(nn.Module):
    
         if configs.is_gpt:
             if configs.pretrain:
-                try:
-                    model_dir = '/data_disk/lichx/Kaggle'
-                    self.gemma2 = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                                    output_attentions=True,
-                                                                    attn_implementation="eager",
-                                                                    output_hidden_states=True,
-                                                                    quantization_config=self.quantization_config)
-                    print('------------------Gemma2 loading completed------------------')
-                except Exception as e:
-                    print(f'Error: {e}')
+                # OPTIMIZATION: Use cached model if available
+                if _GEMMA2_MODEL_CACHE is not None:
+                    print('------------------Using cached Gemma2 model------------------')
+                    self.gemma2 = _GEMMA2_MODEL_CACHE
+                else:
+                    try:
+                        model_dir = '/data_disk/lichx/Kaggle'
+                        self.gemma2 = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                                        output_attentions=True,
+                                                                        attn_implementation="eager",
+                                                                        output_hidden_states=True,
+                                                                        quantization_config=self.quantization_config)
+                        print('------------------Gemma2 loading completed------------------')
+                        # Cache the loaded model
+                        _GEMMA2_MODEL_CACHE = self.gemma2
+                    except Exception as e:
+                        print(f'Error: {e}')
             else:
                 print("------------------no pretrain------------------")
       

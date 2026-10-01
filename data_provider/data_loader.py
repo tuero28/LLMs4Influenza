@@ -12,6 +12,31 @@ from pathlib import Path
 
 warnings.filterwarnings('ignore')
 
+
+def convert_freq_to_string(freq):
+    """Convert frequency to pandas-compatible string format.
+    
+    Args:
+        freq: Can be int or string
+            - If int: 1=Weekly, 2=Daily, 3=Hourly, 4=Minutely
+            - If string: Return as-is (e.g., 'W', 'D', 'h')
+    
+    Returns:
+        String frequency compatible with pandas (e.g., 'W', 'D', 'h')
+    """
+    if isinstance(freq, str):
+        return freq
+    
+    # Map integer freq to pandas freq string
+    freq_map = {
+        1: 'W',  # Weekly (flu data default)
+        2: 'D',  # Daily
+        3: 'h',  # Hourly
+        4: 't',  # Minutely
+    }
+    return freq_map.get(freq, 'W')  # Default to weekly
+
+
 class Dataset_ETT_hour(Dataset):
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
@@ -84,7 +109,7 @@ class Dataset_ETT_hour(Dataset):
             df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
             data_stamp = df_stamp.drop(['date'], 1).values
         elif self.timeenc == 1:
-            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=convert_freq_to_string(self.freq))
             data_stamp = data_stamp.transpose(1, 0)
 
         self.data_x = data[border1:border2]
@@ -181,7 +206,7 @@ class Dataset_ETT_minute(Dataset):
             df_stamp['minute'] = df_stamp.minute.map(lambda x: x // 15)
             data_stamp = df_stamp.drop(['date'], 1).values
         elif self.timeenc == 1:
-            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=convert_freq_to_string(self.freq))
             data_stamp = data_stamp.transpose(1, 0)
 
         self.data_x = data[border1:border2]
@@ -303,7 +328,7 @@ class Dataset_Custom(Dataset):
             df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
             data_stamp = df_stamp.drop(['date'], 1).values
         elif self.timeenc == 1:
-            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=convert_freq_to_string(self.freq))
             data_stamp = data_stamp.transpose(1, 0)
 
         self. data_x = data[border1:border2]
@@ -401,7 +426,7 @@ class Dataset_Pred(Dataset):
 
         tmp_stamp = df_raw[['date']][border1:border2]
         tmp_stamp['date'] = pd.to_datetime(tmp_stamp.date)
-        pred_dates = pd.date_range(tmp_stamp.date.values[-1], periods=self.pred_len + 1, freq=self.freq)
+        pred_dates = pd.date_range(tmp_stamp.date.values[-1], periods=self.pred_len + 1, freq=convert_freq_to_string(self.freq))
 
         df_stamp = pd.DataFrame(columns=['date'])
         df_stamp.date = list(tmp_stamp.date.values) + list(pred_dates[1:])
@@ -414,7 +439,7 @@ class Dataset_Pred(Dataset):
             df_stamp['minute'] = df_stamp.minute.map(lambda x: x // 15)
             data_stamp = df_stamp.drop(['date'], 1).values
         elif self.timeenc == 1:
-            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=convert_freq_to_string(self.freq))
             data_stamp = data_stamp.transpose(1, 0)
 
         self.data_x = data[border1:border2]

@@ -7,11 +7,16 @@ from torch.utils.checkpoint import checkpoint
 from transformers import LlamaForCausalLM, LlamaModel, BitsAndBytesConfig
 from einops import rearrange
 
+# Global cache for pre-loaded Llama2 model
+_LLAMA2_MODEL_CACHE = None
+
 
 class Llama2(nn.Module):
     
     def __init__(self, configs, device):
         super(Llama2, self).__init__()
+        global _LLAMA2_MODEL_CACHE
+        
         self.is_gpt = configs.is_gpt
         self.patch_size = configs.patch_size
         self.pretrain = configs.pretrain
@@ -24,17 +29,24 @@ class Llama2(nn.Module):
         
         if configs.is_gpt:
             if configs.pretrain:
-                try:
-                    model_dir = './data_disk/lichx/Model_from_HF/LLAMA2'
-                    self.llama2 = LlamaForCausalLM.from_pretrained(model_dir,
-                                                                    output_attentions=True,
-                                                                    output_hidden_states=True,
-                                                                    torch_dtype=torch.float16,
-                                                                    # quantization_config=self.quantization_config
-                                                                    )
-                    print('------------------Llma2 loading completed------------------')
-                except Exception as e:
-                    print(f'Error: {e}')
+                # OPTIMIZATION: Use cached model if available
+                if _LLAMA2_MODEL_CACHE is not None:
+                    print('------------------Using cached Llama2 model------------------')
+                    self.llama2 = _LLAMA2_MODEL_CACHE
+                else:
+                    try:
+                        model_dir = './data_disk/lichx/Model_from_HF/LLAMA2'
+                        self.llama2 = LlamaForCausalLM.from_pretrained(model_dir,
+                                                                        output_attentions=True,
+                                                                        output_hidden_states=True,
+                                                                        torch_dtype=torch.float16,
+                                                                        # quantization_config=self.quantization_config
+                                                                        )
+                        print('------------------Llama2 loading completed------------------')
+                        # Cache the loaded model
+                        _LLAMA2_MODEL_CACHE = self.llama2
+                    except Exception as e:
+                        print(f'Error: {e}')
             else:
                 print("------------------no pretrain------------------")
                 # self.llama2 = LlamaForCausalLM(GPT2Config())
