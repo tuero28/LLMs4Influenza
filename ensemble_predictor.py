@@ -1,495 +1,482 @@
 """
 Ensemble Predictor for Flu Forecasting
-Combines predictions from multiple models (Llama2, Llama3, Gemma2, PatchTST, DLinear)
-to improve robustness and accuracy.
-
-Ensemble Strategies:
-1. Simple Average
-2. Weighted Average (learned weights)
-3. Median Ensemble
-4. Stacking (meta-model on predictions)
+Combines DLinear, PatchTST, and Llama2 models
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from pathlib import Path
-import json
+from torch.utils.data import DataLoader
 import os
+import argparse
+from data_provider.data_factory import data_provider
+from models.DLinear import DLinear
+from models.PatchTST import PatchTST
+from models.Llama2 import Llama2
+from utils.metrics import metric
+from utils.epidemic_metrics import epidemic_metrics, print_epidemic_metrics
+from utils.post_processing import clip_predictions, analyze_clipping_impact, print_clipping_analysis
 
 
-class EnsemblePredictor(nn.Module):
+class EnsemblePredictor:
     """
-    Ensemble predictor that combines multiple trained models.
-    
-    Args:
-        models: List of model instances [model1, model2, ...]
-        model_names: List of model names ['Llama2', 'PatchTST', ...]
-        strategy: Ensemble strategy ('average', 'weighted', 'median', 'stacking')
-        learnable_weights: If True, learn weights during training (for 'weighted')
+    Ensemble của 3 models: DLinear, PatchTST, Llama2
     """
     
-    def __init__(self, models, model_names=None, strategy='average', learnable_weights=True):
-        super(EnsemblePredictor, self).__init__()
+    def __init__(self, args, device):
+        self.args = args
+        self.device = device
+        self.models = {}
+        self.checkpoints = {}
         
-        self.models = nn.ModuleList(models) if not isinstance(models, nn.ModuleList) else models
-        self.num_models = len(models)
-        self.strategy = strategy
-        self.learnable_weights = learnable_weights
+        # Parse weights
+        weights = [float(w) for w in args.ensemble_weights.split(',')]
+        assert len(weights) == 3, "Must provide 3 weights for DLinear, PatchTST, Llama2"
+        assert abs(sum(weights) - 1.0) < 0.01, f"Weights must sum to 1.0, got {sum(weights)}"
         
-        if model_names is None:
-            self.model_names = [f"model_{i}" for i in range(self.num_models)]
+        self.weights = {
+            'DLinear': weights[0],
+            'PatchTST': weights[1],
+            'Llama2': weights[2]
+        }
+        
+        print(f"\n{'='*70}")
+        print(f"ENSEMBLE PREDICTOR")
+        print(f"{'='*70}")
+        print(f"Weights: DLinear={self.weights['DLinear']:.2f}, "
+              f"PatchTST={self.weights['PatchTST']:.2f}, "
+              f"Llama2={self.weights['Llama2']:.2f}")
+        print(f"{'='*70}\n")
+    
+    def load_model(self, model_type, checkpoint_path):
+        """Load a single model from checkpoint"""
+        
+        print(f"\n[*] Loading {model_type} from {checkpoint_path}")
+        
+        # Create model-specific config based on model type
+        if model_type in ['DLinear', 'PatchTST']:
+            # DLinear and PatchTST use d_model=768, d_ff=512
+            model_args = argparse.Namespace(**vars(self.args))
+            model_args.d_model = 768
+            model_args.d_ff = 512
+        elif model_type == 'Llama2':
+            # Llama2 uses d_model=4096, d_ff=2048 from self.args (already set)
+            model_args = self.args
         else:
-            self.model_names = model_names
+            model_args = self.args
         
-        # Initialize weights for weighted ensemble
-        if strategy == 'weighted' and learnable_weights:
-            # Initialize with equal weights
-            self.weights = nn.Parameter(torch.ones(self.num_models) / self.num_models)
-        elif strategy == 'weighted' and not learnable_weights:
-            # Fixed equal weights
-            self.register_buffer('weights', torch.ones(self.num_models) / self.num_models)
-        
-        # Stacking meta-model (simple linear layer)
-        if strategy == 'stacking':
-            self.meta_model = nn.Sequential(
-                nn.Linear(self.num_models, 32),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(32, 1)
-            )
-    
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, itr=0, mask=None):
-        """
-        Forward pass through ensemble.
-        
-        Args:
-            x_enc: Encoder input [batch_size, seq_len, features]
-            x_mark_enc: Encoder time marks
-            x_dec: Decoder input
-            x_mark_dec: Decoder time marks
-            itr: Iteration number (for some models)
-            mask: Optional mask
-        
-        Returns:
-            Ensemble prediction [batch_size, pred_len, features]
-        """
-        predictions = []
-        
-        # Collect predictions from all models
-        for i, model in enumerate(self.models):
-            try:
-                with torch.no_grad() if not self.training else torch.enable_grad():
-                    # Different models have different forward signatures
-                    if hasattr(model, 'forward') and 'itr' in model.forward.__code__.co_varnames:
-                        # LLM-based models (Llama, Gemma)
-                        pred = model(x_enc, itr)
-                    else:
-                        # Transformer-based models (PatchTST, DLinear)
-                        if mask is not None:
-                            pred = model(x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
-                        else:
-                            try:
-                                pred = model(x_enc, x_mark_enc, x_dec, x_mark_dec)
-                            except:
-                                # Some models might not need all inputs
-                                pred = model(x_enc)
-                    
-                    predictions.append(pred)
-            except Exception as e:
-                print(f"Warning: Model {self.model_names[i]} failed: {e}")
-                # Use zero prediction as fallback
-                if len(predictions) > 0:
-                    predictions.append(torch.zeros_like(predictions[0]))
-                else:
-                    raise e
-        
-        # Stack predictions [num_models, batch_size, pred_len, features]
-        predictions = torch.stack(predictions, dim=0)
-        
-        # Apply ensemble strategy
-        if self.strategy == 'average':
-            output = torch.mean(predictions, dim=0)
-        
-        elif self.strategy == 'weighted':
-            # Normalize weights with softmax
-            weights = F.softmax(self.weights, dim=0)
-            # Weighted sum
-            weights = weights.view(-1, 1, 1, 1)  # [num_models, 1, 1, 1]
-            output = torch.sum(predictions * weights, dim=0)
-        
-        elif self.strategy == 'median':
-            output = torch.median(predictions, dim=0)[0]
-        
-        elif self.strategy == 'stacking':
-            # Reshape for meta-model
-            batch_size, pred_len, features = predictions.shape[1:]
-            # [num_models, B, T, F] -> [B, T, F, num_models]
-            predictions_transposed = predictions.permute(1, 2, 3, 0)
-            # Apply meta-model
-            output = self.meta_model(predictions_transposed).squeeze(-1)
-            # [B, T, F, 1] -> [B, T, F]
-        
+        # Create model instance (all models need device parameter)
+        if model_type == 'DLinear':
+            model = DLinear(model_args, self.device)
+        elif model_type == 'PatchTST':
+            model = PatchTST(model_args, self.device)
+        elif model_type == 'Llama2':
+            model = Llama2(model_args, self.device)
         else:
-            raise ValueError(f"Unknown strategy: {self.strategy}")
+            raise ValueError(f"Unknown model type: {model_type}")
         
-        return output
-    
-    def get_model_weights(self):
-        """Get current ensemble weights."""
-        if self.strategy == 'weighted':
-            weights = F.softmax(self.weights, dim=0)
-            return {name: w.item() for name, w in zip(self.model_names, weights)}
-        return None
-    
-    def set_model_weights(self, weights_dict):
-        """
-        Set ensemble weights manually.
+        # Load checkpoint
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         
-        Args:
-            weights_dict: Dict mapping model names to weights
-                         e.g., {'Llama2': 0.3, 'PatchTST': 0.4, 'DLinear': 0.3}
-        """
-        if self.strategy != 'weighted':
-            raise ValueError("Can only set weights for 'weighted' strategy")
-        
-        weights = []
-        for name in self.model_names:
-            if name in weights_dict:
-                weights.append(weights_dict[name])
-            else:
-                weights.append(0.0)
-        
-        weights = torch.tensor(weights, dtype=torch.float32)
-        weights = weights / weights.sum()  # Normalize
-        
-        if self.learnable_weights:
-            self.weights.data = weights.to(self.weights.device)
-        else:
-            self.weights = weights.to(self.weights.device)
-
-
-class AdaptiveEnsemble(nn.Module):
-    """
-    Adaptive ensemble that learns to weight models based on input characteristics.
-    Different models may be better at different time periods or patterns.
-    """
-    
-    def __init__(self, models, model_names=None, input_dim=768):
-        super(AdaptiveEnsemble, self).__init__()
-        
-        self.models = nn.ModuleList(models) if not isinstance(models, nn.ModuleList) else models
-        self.num_models = len(models)
-        
-        if model_names is None:
-            self.model_names = [f"model_{i}" for i in range(self.num_models)]
-        else:
-            self.model_names = model_names
-        
-        # Weight prediction network
-        # Takes input features and predicts weights for each model
-        self.weight_network = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, self.num_models),
-            nn.Softmax(dim=-1)
-        )
-    
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, itr=0, mask=None):
-        """
-        Forward pass with adaptive weighting.
-        
-        Args:
-            x_enc: Encoder input [batch_size, seq_len, features]
-            x_mark_enc: Encoder time marks
-            x_dec: Decoder input
-            x_mark_dec: Decoder time marks
-            itr: Iteration number
-            mask: Optional mask
-        
-        Returns:
-            Ensemble prediction [batch_size, pred_len, features]
-        """
-        predictions = []
-        
-        # Collect predictions from all models
-        for model in self.models:
-            try:
-                with torch.no_grad() if not self.training else torch.enable_grad():
-                    if hasattr(model, 'forward') and 'itr' in model.forward.__code__.co_varnames:
-                        pred = model(x_enc, itr)
-                    else:
-                        if mask is not None:
-                            pred = model(x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
-                        else:
-                            try:
-                                pred = model(x_enc, x_mark_enc, x_dec, x_mark_dec)
-                            except:
-                                pred = model(x_enc)
-                    predictions.append(pred)
-            except Exception as e:
-                print(f"Warning: Model failed: {e}")
-                if len(predictions) > 0:
-                    predictions.append(torch.zeros_like(predictions[0]))
-                else:
-                    raise e
-        
-        # Stack predictions
-        predictions = torch.stack(predictions, dim=0)  # [num_models, B, T, F]
-        
-        # Predict weights based on input
-        # Use mean of input sequence as feature
-        input_features = x_enc.mean(dim=1)  # [B, F]
-        weights = self.weight_network(input_features)  # [B, num_models]
-        
-        # Apply adaptive weights
-        weights = weights.unsqueeze(1).unsqueeze(-1)  # [B, 1, num_models, 1]
-        predictions = predictions.permute(1, 2, 0, 3)  # [B, T, num_models, F]
-        
-        output = torch.sum(predictions * weights, dim=2)  # [B, T, F]
-        
-        return output
-
-
-def load_ensemble_models(configs, checkpoint_paths):
-    """
-    Load multiple models from checkpoints for ensemble.
-    
-    Args:
-        configs: List of config objects for each model
-        checkpoint_paths: List of checkpoint file paths
-    
-    Returns:
-        models: List of loaded models
-        model_names: List of model names
-    """
-    models = []
-    model_names = []
-    
-    for config, ckpt_path in zip(configs, checkpoint_paths):
-        # Import model class dynamically
-        model_name = config.model
-        model_names.append(model_name)
-        
-        # Load model
-        if model_name == 'Llama2':
-            from models.Llama2 import Model
-        elif model_name == 'Llama3':
-            from models.Llama3 import Model
-        elif model_name == 'Gemma2':
-            from models.Gemma2 import Model
-        elif model_name == 'PatchTST':
-            from models.PatchTST import Model
-        elif model_name == 'DLinear':
-            from models.DLinear import Model
-        elif model_name == 'GPT4TS':
-            from models.GPT4TS import Model
-        else:
-            raise ValueError(f"Unknown model: {model_name}")
-        
-        # Initialize model
-        model = Model(config)
-        
-        # Load checkpoint if provided
-        if ckpt_path and os.path.exists(ckpt_path):
-            checkpoint = torch.load(ckpt_path, map_location='cpu')
-            model.load_state_dict(checkpoint)
-            print(f"✓ Loaded {model_name} from {ckpt_path}")
-        else:
-            print(f"⚠ No checkpoint for {model_name}, using random initialization")
-        
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        model.load_state_dict(checkpoint)
+        model.to(self.device)
         model.eval()
-        models.append(model)
+        
+        print(f"[OK] {model_type} loaded successfully (d_model={model_args.d_model})")
+        
+        self.models[model_type] = model
+        self.checkpoints[model_type] = checkpoint_path
     
-    return models, model_names
+    def load_all_models(self, checkpoint_paths):
+        """
+        Load all 3 models
+        
+        Args:
+            checkpoint_paths: dict with keys 'DLinear', 'PatchTST', 'Llama2'
+        """
+        for model_type, path in checkpoint_paths.items():
+            if self.weights[model_type] > 0:  # Only load if weight > 0
+                self.load_model(model_type, path)
+    
+    def predict_single(self, model_type, batch_x, batch_x_mark, batch_y_mark):
+        """Get prediction from a single model"""
+        
+        model = self.models[model_type]
+        
+        with torch.no_grad():
+            batch_x = batch_x.float().to(self.device)
+            
+            if model_type in ['Llama2', 'DLinear', 'PatchTST']:
+                # These models use itr parameter and don't need marks
+                outputs = model(batch_x, itr=0)
+            else:
+                # Other models may need marks
+                if batch_x_mark is not None:
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                if batch_y_mark is not None:
+                    batch_y_mark = batch_y_mark.float().to(self.device)
+                
+                # Create dummy dec_inp for encoder-decoder models
+                dec_inp = torch.zeros([batch_x.shape[0], self.args.pred_len, batch_x.shape[-1]]).float().to(self.device)
+                
+                outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            
+            # Extract predictions (handle different output formats)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+            
+            # Ensure correct shape [B, pred_len, features]
+            if outputs.dim() == 2:
+                outputs = outputs.unsqueeze(-1)
+        
+        return outputs
+    
+    def predict_ensemble(self, batch_x, batch_x_mark, batch_y_mark):
+        """
+        Get ensemble prediction by weighted average
+        
+        Returns:
+            ensemble_pred: [B, pred_len, features]
+        """
+        
+        predictions = {}
+        
+        # Get predictions from each model
+        for model_type in self.models.keys():
+            if self.weights[model_type] > 0:
+                pred = self.predict_single(model_type, batch_x, batch_x_mark, batch_y_mark)
+                predictions[model_type] = pred
+        
+        # Weighted average
+        ensemble_pred = None
+        for model_type, pred in predictions.items():
+            weight = self.weights[model_type]
+            if ensemble_pred is None:
+                ensemble_pred = weight * pred
+            else:
+                ensemble_pred += weight * pred
+        
+        return ensemble_pred
+    
+    def evaluate(self, test_loader):
+        """
+        Evaluate ensemble on test set
+        
+        Returns:
+            metrics: dict with all evaluation metrics
+        """
+        
+        print(f"\n{'='*70}")
+        print("ENSEMBLE EVALUATION")
+        print(f"{'='*70}\n")
+        
+        preds = []
+        trues = []
+        
+        for i, batch in enumerate(test_loader):
+            # Handle different batch formats
+            if len(batch) == 4:
+                batch_x, batch_y, batch_x_mark, batch_y_mark = batch
+            elif len(batch) == 2:
+                batch_x, batch_y = batch
+                batch_x_mark, batch_y_mark = None, None
+            else:
+                raise ValueError(f"Unexpected batch format with {len(batch)} elements")
+            
+            batch_y = batch_y.float().to(self.device)
+            
+            # Get ensemble prediction
+            outputs = self.predict_ensemble(batch_x, batch_x_mark, batch_y_mark)
+            
+            # Extract ground truth
+            if self.args.features == 'MS':
+                outputs = outputs[:, -self.args.pred_len:, -1:]
+                batch_y = batch_y[:, -self.args.pred_len:, -1:]
+            else:
+                outputs = outputs[:, -self.args.pred_len:, :]
+                batch_y = batch_y[:, -self.args.pred_len:, :]
+            
+            preds.append(outputs.detach().cpu().numpy())
+            trues.append(batch_y.detach().cpu().numpy())
+        
+        # Concatenate all batches
+        preds = np.concatenate(preds, axis=0)
+        trues = np.concatenate(trues, axis=0)
+        
+        print(f"Predictions shape: {preds.shape}")
+        print(f"Ground truth shape: {trues.shape}")
+        
+        # Reshape for metrics
+        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
+        
+        # Clipping analysis
+        print(f"\n{'='*70}")
+        print("POST-PROCESSING: CLIPPING ANALYSIS")
+        print(f"{'='*70}\n")
+        
+        preds_original = preds.copy()
+        preds_clipped = clip_predictions(preds, min_value=0.0)
+        
+        clipping_analysis = analyze_clipping_impact(preds_original, preds_clipped, trues)
+        print_clipping_analysis(clipping_analysis)
+        
+        # Standard metrics - BEFORE clipping
+        print(f"\n{'='*70}")
+        print("STANDARD METRICS - BEFORE CLIPPING")
+        print(f"{'='*70}\n")
+        
+        mae_orig, mse_orig, rmse_orig, mape_orig, mspe_orig, smape_orig, nd_orig = metric(preds_original, trues)
+        print(f'mse:{mse_orig:.6f}, mae:{mae_orig:.6f}, rmse:{rmse_orig:.6f}')
+        print(f'mape:{mape_orig:.6f}, smape:{smape_orig:.6f}')
+        
+        # Standard metrics - AFTER clipping
+        print(f"\n{'='*70}")
+        print("STANDARD METRICS - AFTER CLIPPING (RECOMMENDED)")
+        print(f"{'='*70}\n")
+        
+        mae, mse, rmse, mape, mspe, smape, nd = metric(preds_clipped, trues)
+        print(f'mse:{mse:.6f}, mae:{mae:.6f}, rmse:{rmse:.6f}')
+        print(f'mape:{mape:.6f}, smape:{smape:.6f}')
+        
+        # Epidemic metrics
+        print(f"\n{'='*70}")
+        print("EPIDEMIC-SPECIFIC METRICS")
+        print(f"{'='*70}\n")
+        
+        epidemic_results = epidemic_metrics(preds_clipped, trues)
+        print_epidemic_metrics(epidemic_results)
+        
+        # Compute Spearman and Pearson correlation
+        from scipy.stats import spearmanr, pearsonr
+        
+        preds_flat = preds_clipped.reshape(-1)
+        trues_flat = trues.reshape(-1)
+        
+        spearman_r, _ = spearmanr(preds_flat, trues_flat)
+        pearson_r, _ = pearsonr(preds_flat, trues_flat)
+        
+        print(f"\n{'='*70}")
+        print("SUMMARY")
+        print(f"{'='*70}")
+        print(f"spearmanR: {spearman_r:.4f}, pearsonR: {pearson_r:.4f}")
+        print(f"mae: {mae:.4f}, mse: {mse:.4f}, mape: {mape:.4f}, smape: {smape:.4f}")
+        print(f"Epidemic Metrics:")
+        print(f"  Peak Timing Error: {epidemic_results['peak_timing_error_weeks']:.2f} weeks")
+        print(f"  Peak Intensity Error: {epidemic_results['peak_intensity_abs_error']:.2f}%")
+        print(f"  Direction Accuracy: {epidemic_results['direction_accuracy_pct']:.1f}%")
+        print(f"{'='*70}\n")
+        
+        return {
+            'mae': mae,
+            'mse': mse,
+            'rmse': rmse,
+            'mape': mape,
+            'smape': smape,
+            'spearman_r': spearman_r,
+            'pearson_r': pearson_r,
+            **epidemic_results
+        }
 
 
-def create_ensemble_from_checkpoints(checkpoint_dir, model_configs, strategy='weighted'):
+def find_best_checkpoint(base_path, model_name):
     """
-    Create ensemble from trained model checkpoints.
+    Find best checkpoint for a model (choose itr0 by default)
     
     Args:
-        checkpoint_dir: Directory containing model checkpoints
-        model_configs: List of config objects
-        strategy: Ensemble strategy
+        base_path: checkpoints directory
+        model_name: 'DLinear_optimized', 'PatchTST_fast', 'Llama2_raw_augmented'
     
     Returns:
-        ensemble: EnsemblePredictor instance
+        checkpoint_path: path to checkpoint.pth
     """
-    checkpoint_dir = Path(checkpoint_dir)
+    # Search pattern
+    pattern = f"{model_name}_sl*_itr0"  # Always use iteration 0
     
-    # Find checkpoint files
-    checkpoint_paths = []
-    for config in model_configs:
-        # Look for checkpoint pattern matching the config
-        pattern = f"{config.model}_*_itr{config.itr}/checkpoint.pth"
-        matches = list(checkpoint_dir.glob(pattern))
-        
-        if matches:
-            checkpoint_paths.append(str(matches[0]))
-        else:
-            checkpoint_paths.append(None)
-            print(f"⚠ No checkpoint found for {config.model}")
+    matching_dirs = [d for d in os.listdir(base_path) if d.startswith(model_name) and 'itr0' in d]
+    
+    if not matching_dirs:
+        raise FileNotFoundError(f"No checkpoint found for {model_name}")
+    
+    # Use first match
+    checkpoint_dir = os.path.join(base_path, matching_dirs[0])
+    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
+    
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    
+    return checkpoint_path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    
+    # Basic configs
+    parser.add_argument('--model', type=str, default='ensemble')
+    parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints/')
+    
+    # Model names
+    parser.add_argument('--dlinear_name', type=str, default='DLinear_optimized')
+    parser.add_argument('--patchtst_name', type=str, default='PatchTST_fast')
+    parser.add_argument('--llama2_name', type=str, default='Llama2_raw_augmented')
+    
+    # Ensemble weights
+    parser.add_argument('--ensemble_weights', type=str, default='0.3,0.3,0.4',
+                        help='Weights for DLinear,PatchTST,Llama2 (must sum to 1.0)')
+    
+    # Data configs
+    parser.add_argument('--root_path', type=str, default='./dataset/')
+    parser.add_argument('--data_path', type=str, default='Flu_in_NorthChina.csv')
+    parser.add_argument('--data', type=str, default='custom')
+    parser.add_argument('--features', type=str, default='S')
+    parser.add_argument('--target', type=str, default='positive_rate')
+    parser.add_argument('--freq', type=int, default=0)
+    parser.add_argument('--percent', type=int, default=100)
+    
+    # Model configs
+    parser.add_argument('--seq_len', type=int, default=52)
+    parser.add_argument('--label_len', type=int, default=18)
+    parser.add_argument('--pred_len', type=int, default=8)
+    parser.add_argument('--d_model', type=int, default=768)
+    parser.add_argument('--n_heads', type=int, default=16)
+    parser.add_argument('--e_layers', type=int, default=3)
+    parser.add_argument('--d_ff', type=int, default=512)
+    parser.add_argument('--dropout', type=int, default=0.3)
+    
+    # PatchTST specific
+    parser.add_argument('--patch_size', type=int, default=16)
+    parser.add_argument('--stride', type=int, default=8)
+    
+    # Llama2 specific
+    parser.add_argument('--llama_layers', type=int, default=8)
+    parser.add_argument('--fc_layer', type=int, default=256)
+    parser.add_argument('--pretrain', type=int, default=1)
+    parser.add_argument('--freeze', type=int, default=1)
+    parser.add_argument('--is_gpt', type=int, default=1)
+    
+    # Other
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--embed', type=str, default='timeF')
+    parser.add_argument('--enc_in', type=int, default=1)
+    parser.add_argument('--c_out', type=int, default=1)
+    parser.add_argument('--kernel_size', type=int, default=25)
+    parser.add_argument('--max_len', type=int, default=-1)
+    parser.add_argument('--hid_dim', type=int, default=16)
+    
+    args = parser.parse_args()
+    
+    # Device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Find checkpoints
+    print(f"\n{'='*70}")
+    print("FINDING CHECKPOINTS")
+    print(f"{'='*70}\n")
+    
+    checkpoint_paths = {}
+    
+    try:
+        checkpoint_paths['DLinear'] = find_best_checkpoint(args.checkpoints_dir, args.dlinear_name)
+        print(f"[OK] DLinear: {checkpoint_paths['DLinear']}")
+    except FileNotFoundError as e:
+        print(f"[!] DLinear not found: {e}")
+        checkpoint_paths['DLinear'] = None
+    
+    try:
+        checkpoint_paths['PatchTST'] = find_best_checkpoint(args.checkpoints_dir, args.patchtst_name)
+        print(f"[OK] PatchTST: {checkpoint_paths['PatchTST']}")
+    except FileNotFoundError as e:
+        print(f"[!] PatchTST not found: {e}")
+        checkpoint_paths['PatchTST'] = None
+    
+    try:
+        checkpoint_paths['Llama2'] = find_best_checkpoint(args.checkpoints_dir, args.llama2_name)
+        print(f"[OK] Llama2: {checkpoint_paths['Llama2']}")
+    except FileNotFoundError as e:
+        print(f"[!] Llama2 not found: {e}")
+        checkpoint_paths['Llama2'] = None
+    
+    # Filter out None values
+    checkpoint_paths = {k: v for k, v in checkpoint_paths.items() if v is not None}
+    
+    if len(checkpoint_paths) == 0:
+        raise RuntimeError("No checkpoints found! Please train models first.")
+    
+    # Create ensemble
+    ensemble = EnsemblePredictor(args, device)
     
     # Load models
-    models, model_names = load_ensemble_models(model_configs, checkpoint_paths)
+    ensemble.load_all_models(checkpoint_paths)
     
-    # Create ensemble
-    ensemble = EnsemblePredictor(models, model_names, strategy=strategy)
+    # Load test data
+    print(f"\n{'='*70}")
+    print("LOADING TEST DATA")
+    print(f"{'='*70}\n")
     
-    return ensemble
-
-
-class EnsembleConfig:
-    """Configuration for ensemble predictor."""
+    test_data, test_loader_raw = data_provider(args, 'test')
+    print(f"Test samples: {len(test_data)}")
     
-    def __init__(self):
-        # Model selection
-        self.models = ['Llama2', 'PatchTST', 'DLinear']  # Models to ensemble
-        self.strategy = 'weighted'  # 'average', 'weighted', 'median', 'stacking'
-        self.learnable_weights = True
-        
-        # Initial weights (if not learnable)
-        self.initial_weights = {
-            'Llama2': 0.4,
-            'Llama3': 0.3,
-            'Gemma2': 0.1,
-            'PatchTST': 0.1,
-            'DLinear': 0.1,
-            'GPT4TS': 0.0
-        }
-        
-        # Checkpoint directory
-        self.checkpoint_dir = './checkpoints'
-    
-    def save(self, filepath):
-        """Save configuration to JSON file."""
-        config_dict = {
-            'models': self.models,
-            'strategy': self.strategy,
-            'learnable_weights': self.learnable_weights,
-            'initial_weights': self.initial_weights,
-            'checkpoint_dir': self.checkpoint_dir
-        }
-        with open(filepath, 'w') as f:
-            json.dump(config_dict, f, indent=2)
-    
-    @staticmethod
-    def load(filepath):
-        """Load configuration from JSON file."""
-        with open(filepath, 'r') as f:
-            config_dict = json.load(f)
-        
-        config = EnsembleConfig()
-        config.models = config_dict['models']
-        config.strategy = config_dict['strategy']
-        config.learnable_weights = config_dict.get('learnable_weights', True)
-        config.initial_weights = config_dict.get('initial_weights', {})
-        config.checkpoint_dir = config_dict.get('checkpoint_dir', './checkpoints')
-        
-        return config
-
-
-def test_ensemble():
-    """Test ensemble predictor with dummy models."""
-    
-    print("Testing Ensemble Predictor...")
-    
-    # Create dummy models
-    class DummyModel(nn.Module):
-        def __init__(self, scale=1.0):
-            super().__init__()
-            self.scale = scale
-        
-        def forward(self, x, itr=0):
-            return x * self.scale
-    
-    models = [
-        DummyModel(scale=1.0),
-        DummyModel(scale=1.2),
-        DummyModel(scale=0.8)
-    ]
-    
-    model_names = ['Model1', 'Model2', 'Model3']
-    
-    # Test different strategies
-    strategies = ['average', 'weighted', 'median']
-    
-    for strategy in strategies:
-        print(f"\nTesting {strategy} ensemble...")
-        ensemble = EnsemblePredictor(models, model_names, strategy=strategy)
-        
-        # Create dummy input
-        batch_size, seq_len, features = 2, 52, 1
-        x = torch.randn(batch_size, seq_len, features)
-        
-        # Forward pass
-        output = ensemble(x, None, None, None, itr=0)
-        
-        print(f"  Input shape: {x.shape}")
-        print(f"  Output shape: {output.shape}")
-        print(f"  Output mean: {output.mean().item():.4f}")
-        
-        if strategy == 'weighted':
-            weights = ensemble.get_model_weights()
-            print(f"  Model weights: {weights}")
-    
-    print("\n✅ All ensemble tests passed!")
-
-
-if __name__ == "__main__":
-    test_ensemble()
-
-
-# Convenience function for main.py
-def create_ensemble_model(args, device):
-    """
-    Create ensemble model from args (convenience wrapper).
-    
-    This is a simple wrapper for compatibility with main.py.
-    For more advanced usage, use create_ensemble_from_checkpoints directly.
-    """
-    # Parse model names from args
-    if hasattr(args, 'ensemble_models'):
-        model_names = args.ensemble_models.split(',')
-    else:
-        model_names = ['DLinear', 'PatchTST']  # Default
-    
-    # Import model classes
-    from models.DLinear import DLinear
-    from models.PatchTST import PatchTST
-    from models.Llama2 import Llama2
-    
-    model_classes = {
-        'DLinear': DLinear,
-        'PatchTST': PatchTST,
-        'Llama2': Llama2,
-    }
-    
-    # Create model instances
-    models = []
-    for name in model_names:
-        if name in model_classes:
-            model = model_classes[name](args).to(device)
-            models.append(model)
+    # Create new dataloader with custom collate to handle object dtype
+    def custom_collate(batch):
+        """Custom collate to convert object dtypes to tensors"""
+        # Handle different number of return values
+        if len(batch[0]) == 4:
+            batch_x, batch_y, batch_x_mark, batch_y_mark = zip(*batch)
+        elif len(batch[0]) == 5:
+            # Some datasets return 5 values
+            batch_x, batch_y, batch_x_mark, batch_y_mark, _ = zip(*batch)
+        elif len(batch[0]) == 2:
+            batch_x, batch_y = zip(*batch)
+            batch_x_mark, batch_y_mark = None, None
         else:
-            print(f"Warning: Model {name} not found, skipping")
+            raise ValueError(f"Unexpected batch format: {len(batch[0])} values per sample")
+        
+        # Helper to convert to tensor, handling object dtype
+        def to_tensor(x):
+            if isinstance(x, torch.Tensor):
+                return x.float()
+            elif isinstance(x, np.ndarray):
+                # Convert object dtype to float64 first
+                if x.dtype == object:
+                    x = x.astype(np.float64)
+                return torch.from_numpy(x).float()
+            else:
+                return torch.FloatTensor(x)
+        
+        # Convert to tensors
+        batch_x = torch.stack([to_tensor(x) for x in batch_x])
+        batch_y = torch.stack([to_tensor(y) for y in batch_y])
+        
+        if batch_x_mark is not None and batch_x_mark[0] is not None:
+            batch_x_mark = torch.stack([to_tensor(x) for x in batch_x_mark])
+        else:
+            batch_x_mark = None
+            
+        if batch_y_mark is not None and batch_y_mark[0] is not None:
+            batch_y_mark = torch.stack([to_tensor(y) for y in batch_y_mark])
+        else:
+            batch_y_mark = None
+        
+        return batch_x, batch_y, batch_x_mark, batch_y_mark
     
-    if not models:
-        raise ValueError(f"No valid models found in: {model_names}")
+    test_loader = DataLoader(
+        test_data,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+        collate_fn=custom_collate
+    )
     
-    # Create ensemble
-    strategy = getattr(args, 'ensemble_strategy', 'weighted')
-    ensemble = EnsemblePredictor(
-        models=models,
-        model_names=model_names,
-        strategy=strategy,
-        learnable_weights=True
-    ).to(device)
+    # Evaluate
+    metrics = ensemble.evaluate(test_loader)
     
-    print(f"✓ Created ensemble with {len(models)} models: {model_names}")
-    return ensemble
+    print("\n[OK] Ensemble evaluation completed!")
+
+
+if __name__ == '__main__':
+    main()

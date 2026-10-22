@@ -87,6 +87,14 @@ def direction_accuracy(pred, true):
     pred_diff = pred[..., 1:] - pred[..., :-1]
     true_diff = true[..., 1:] - true[..., :-1]
     
+    # Handle edge cases
+    if pred_diff.size == 0 or true_diff.size == 0:
+        return 0.0
+    
+    # Check if all predictions are same (no direction changes)
+    if np.all(pred_diff == 0):
+        return 0.0  # No direction predicted
+    
     # Get direction: +1 (increase), -1 (decrease), 0 (no change)
     pred_direction = np.sign(pred_diff)
     true_direction = np.sign(true_diff)
@@ -95,7 +103,11 @@ def direction_accuracy(pred, true):
     correct = (pred_direction == true_direction)
     accuracy = np.mean(correct) * 100
     
-    return accuracy
+    # Handle NaN
+    if np.isnan(accuracy):
+        return 0.0
+    
+    return float(accuracy)
 
 
 def learn_outbreak_threshold(train_data, percentile=75):
